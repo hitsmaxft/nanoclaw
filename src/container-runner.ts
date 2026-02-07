@@ -51,6 +51,10 @@ export interface ContainerOutput {
   error?: string;
 }
 
+export interface ContainerOptions {
+  onStatusUpdate?: (message: string) => void;
+}
+
 interface VolumeMount {
   hostPath: string;
   containerPath: string;
@@ -124,7 +128,8 @@ function buildVolumeMounts(group: RegisteredGroup, isMain: boolean): VolumeMount
   const envFile = path.join(projectRoot, '.env');
   if (fs.existsSync(envFile)) {
     const envContent = fs.readFileSync(envFile, 'utf-8');
-    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
+    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 
+      'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL'];
     const filteredLines = envContent
       .split('\n')
       .filter(line => {
@@ -175,7 +180,8 @@ function buildContainerArgs(mounts: VolumeMount[]): string[] {
 
 export async function runContainerAgent(
   group: RegisteredGroup,
-  input: ContainerInput
+  input: ContainerInput,
+  options?: ContainerOptions
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
@@ -231,13 +237,27 @@ export async function runContainerAgent(
       const lines = chunk.trim().split('\n');
       for (const line of lines) {
         if (line) logger.debug({ container: group.folder }, line);
+
+        // Detect status updates and send immediately via callback
+        // Lines look like: [agent-runner] STATUS: message
+        if (line.includes('STATUS:')) {
+          const statusMessage = line.split('STATUS:')[1]?.trim();
+          if (statusMessage && options?.onStatusUpdate) {
+            // Send immediately via callback for real-time updates
+            try {
+              options.onStatusUpdate(statusMessage);
+            } catch (err) {
+              logger.error({ group: group.name, err }, 'Status callback error');
+            }
+          }
+        }
       }
       if (stderrTruncated) return;
       const remaining = CONTAINER_MAX_OUTPUT_SIZE - stderr.length;
       if (chunk.length > remaining) {
         stderr += chunk.slice(0, remaining);
         stderrTruncated = true;
-        logger.warn({ group: group.name, size: stderr.length }, 'Container stderr truncated due to size limit');
+        logger.warn({ group: group.name, size: stdout.length }, 'Container stderr truncated due to size limit');
       } else {
         stderr += chunk;
       }

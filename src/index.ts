@@ -1,50 +1,53 @@
-import makeWASocket, {
-  useMultiFileAuthState,
-  DisconnectReason,
-  makeCacheableSignalKeyStore,
-  WASocket
-} from '@whiskeysockets/baileys';
 import pino from 'pino';
-import { exec, execSync } from 'child_process';
+import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
 import {
   ASSISTANT_NAME,
-  POLL_INTERVAL,
   STORE_DIR,
   DATA_DIR,
   TRIGGER_PATTERN,
+  escapeRegex,
   MAIN_GROUP_FOLDER,
   IPC_POLL_INTERVAL,
-  TIMEZONE
+  TIMEZONE,
+  POLL_INTERVAL,
 } from './config.js';
 import { RegisteredGroup, Session, NewMessage } from './types.js';
-import { initDatabase, storeMessage, storeChatMetadata, getNewMessages, getMessagesSince, getAllTasks, getTaskById, updateChatName, getAllChats, getLastGroupSync, setLastGroupSync } from './db.js';
+import {
+  initDatabase,
+  storeMessage,
+  storeChatMetadata,
+  getNewMessages,
+  getMessagesSince,
+  getAllTasks,
+  updateTaskAfterRun,
+  logTaskRun,
+  getAllChats,
+  getChat,
+} from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
+import { executeCommand, commands } from './commands.js';
 import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot, AvailableGroup } from './container-runner.js';
 import { loadJson, saveJson } from './utils.js';
-
-const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+import { TelegramMessenger } from './telegram.js';
+import { FeishuMessenger } from './feishu.js';
 
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
   transport: { target: 'pino-pretty', options: { colorize: true } }
 });
 
-let sock: WASocket;
 let lastTimestamp = '';
 let sessions: Session = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
+let messenger: TelegramMessenger | FeishuMessenger;
+let messengerType: 'telegram' | 'feishu' = (process.env.MESSENGER as any) || 'telegram';
 
-async function setTyping(jid: string, isTyping: boolean): Promise<void> {
-  try {
-    await sock.sendPresenceUpdate(isTyping ? 'composing' : 'paused', jid);
-  } catch (err) {
-    logger.debug({ jid, err }, 'Failed to update typing status');
-  }
-}
+// Track processed message IDs to avoid duplicates (for WebSocket messengers like Feishu)
+let processedMessageIds: Set<string> = new Set();
 
 function loadState(): void {
   const statePath = path.join(DATA_DIR, 'router_state.json');
@@ -73,41 +76,102 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
 }
 
 /**
- * Sync group metadata from WhatsApp.
- * Fetches all participating groups and stores their names in the database.
- * Called on startup, daily, and on-demand via IPC.
+ * Check if main session is already registered
+ * Returns the chatJid of the main session, or undefined if none exists
  */
-async function syncGroupMetadata(force = false): Promise<void> {
-  // Check if we need to sync (skip if synced recently, unless forced)
-  if (!force) {
-    const lastSync = getLastGroupSync();
-    if (lastSync) {
-      const lastSyncTime = new Date(lastSync).getTime();
-      const now = Date.now();
-      if (now - lastSyncTime < GROUP_SYNC_INTERVAL_MS) {
-        logger.debug({ lastSync }, 'Skipping group sync - synced recently');
-        return;
-      }
-    }
+function getExistingMainSession(): string | undefined {
+  return Object.entries(registeredGroups).find(
+    ([, group]) => group.folder === MAIN_GROUP_FOLDER
+  )?.[0];
+}
+
+/**
+ * Handle /register command for self-registration
+ * Can be called even for unregistered chats
+ * Returns response text to be sent
+ */
+async function handleRegisterCommand(
+  chatJid: string,
+  senderName: string,
+  folderName?: string,
+  chatType?: 'private' | 'group',
+  senderId?: string, // For private chats: restrict to this sender
+  messengerType?: 'telegram' | 'feishu'
+): Promise<string> {
+  // Check if already registered
+  if (registeredGroups[chatJid]) {
+    return `✅ This chat is already registered as workspace: **${registeredGroups[chatJid].name}**`;
   }
 
-  try {
-    logger.info('Syncing group metadata from WhatsApp...');
-    const groups = await sock.groupFetchAllParticipating();
+  // Get chat info from database for accurate name
+  const chatInfo = getChat(chatJid);
+  const displayName = chatInfo?.name || senderName || 'Chat';
 
-    let count = 0;
-    for (const [jid, metadata] of Object.entries(groups)) {
-      if (metadata.subject) {
-        updateChatName(jid, metadata.subject);
-        count++;
-      }
+  // Determine folder assignment
+  let folder: string;
+  let isMainSession = false;
+
+  if (folderName) {
+    // User specified a folder name
+    folder = folderName;
+  } else if (chatType === 'private') {
+    // For private chats (Feishu p2p / Telegram DM)
+    // Check if main session already exists
+    const existingMain = getExistingMainSession();
+    if (existingMain) {
+      // Main session exists, create a regular folder for this p2p chat
+      folder = chatInfo?.name
+        ? chatInfo.name.replace(/[^a-z0-9-]/gi, '-')
+        : `p2p-${Date.now()}`;
+    } else {
+      // No main session yet, this becomes the main
+      folder = MAIN_GROUP_FOLDER;
+      isMainSession = true;
     }
-
-    setLastGroupSync();
-    logger.info({ count }, 'Group metadata synced');
-  } catch (err) {
-    logger.error({ err }, 'Failed to sync group metadata');
+  } else {
+    // For group chats, use the stored name
+    folder = chatInfo?.name
+      ? chatInfo.name.replace(/[^a-z0-9-]/gi, '-')
+      : `chat-${Date.now()}`;
   }
+
+  const sanitizedFolder = folder.replace(/[^a-z0-9-]/gi, '-');
+
+  // Set trigger based on chat type
+  // Main session and private chats don't need trigger
+  // Other groups may need trigger
+  const trigger = (isMainSession || chatType === 'private') ? '' : '';
+
+  // For private chats, restrict to sender who registered
+  const allowedUsers = (chatType === 'private' && senderId) ? [senderId] : undefined;
+
+  // Register the group
+  registerGroup(chatJid, {
+    name: displayName,
+    folder: sanitizedFolder,
+    trigger,
+    added_at: new Date().toISOString(),
+    allowedUsers,
+    isMainSession,
+  });
+
+  if (isMainSession) {
+    return `✅ Main session registered!
+
+Name: **${displayName}**
+Folder: ${sanitizedFolder}
+Type: Private (Main Session)
+
+You are the main user of NanoClaw with full access.`;
+  }
+
+  return `✅ Workspace registered!
+
+Name: **${displayName}**
+Folder: ${sanitizedFolder}
+Type: ${chatType === 'private' ? 'Private' : 'Group'}
+
+You can now start chatting!`;
 }
 
 /**
@@ -119,7 +183,7 @@ function getAvailableGroups(): AvailableGroup[] {
   const registeredJids = new Set(Object.keys(registeredGroups));
 
   return chats
-    .filter(c => c.jid !== '__group_sync__' && c.jid.endsWith('@g.us'))
+    .filter(c => c.jid !== '__group_sync__')
     .map(c => ({
       jid: c.jid,
       name: c.name,
@@ -129,14 +193,91 @@ function getAvailableGroups(): AvailableGroup[] {
 }
 
 async function processMessage(msg: NewMessage): Promise<void> {
+  // Deduplicate messages - skip if already processed
+  if (processedMessageIds.has(msg.id)) {
+    logger.debug({ messageId: msg.id }, 'Message already processed, skipping');
+    return;
+  }
+  processedMessageIds.add(msg.id);
+
+  // Keep only last 1000 message IDs to prevent memory issues
+  if (processedMessageIds.size > 1000) {
+    const idsArray = Array.from(processedMessageIds);
+    processedMessageIds = new Set(idsArray.slice(-1000));
+  }
+
+  logger.info({
+    chatJid: msg.chat_jid,
+    sender: msg.sender_name,
+    content: msg.content,
+    id: msg.id,
+  }, 'processMessage called');
+
   const group = registeredGroups[msg.chat_jid];
-  if (!group) return;
+  const content = msg.content.trim().toLowerCase();
 
-  const content = msg.content.trim();
-  const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
+  // Check if it's a /register command - allow even for unregistered chats
+  if (content === '/register' || content.startsWith('/register ')) {
+    const folderName = content.startsWith('/register ') ? msg.content.trim().slice(9).trim() : undefined;
+    const response = await handleRegisterCommand(msg.chat_jid, msg.sender_name, folderName, msg.chat_type, msg.sender, messengerType);
+    await messenger.sendMessage(msg.chat_jid, response);
+    return;
+  }
 
-  // Main group responds to all messages; other groups require trigger prefix
-  if (!isMainGroup && !TRIGGER_PATTERN.test(content)) return;
+  // For all other messages, require registration
+  if (!group) {
+    await messenger.sendMessage(msg.chat_jid, `👋 Welcome!
+
+Send **/register** to register this chat as a workspace.`);
+    return;
+  }
+
+  // Authorization check: for private chats with allowedUsers restriction,
+  // only allow the registered user to send messages
+  if (msg.chat_type === 'private' && group.allowedUsers && group.allowedUsers.length > 0) {
+    if (!group.allowedUsers.includes(msg.sender)) {
+      logger.warn({
+        chatJid: msg.chat_jid,
+        sender: msg.sender,
+        allowedUsers: group.allowedUsers,
+      }, 'Unauthorized user attempted to chat in private session');
+      await messenger.sendMessage(msg.chat_jid, `⛔ You are not authorized for this session.`);
+      return;
+    }
+  }
+
+  const isMainGroup = group.folder === MAIN_GROUP_FOLDER || group.isMainSession === true;
+
+  // Main group and private chats (empty trigger) respond to all messages
+  // Other groups require trigger prefix
+  if (!isMainGroup && group.trigger) {
+    const groupTriggerPattern = new RegExp(`^${escapeRegex(group.trigger)}\\b`, 'i');
+    if (!groupTriggerPattern.test(content)) return;
+  }
+
+  // Check if message is a command
+  const commandResult = await executeCommand(content, group.trigger, {
+    chatId: msg.chat_jid,
+    groupName: group.name,
+    groupFolder: group.folder,
+    content,
+    timestamp: msg.timestamp,
+  });
+
+  if (commandResult.handled) {
+    // Command was handled, send response
+    if (commandResult.response) {
+      await messenger.sendMessage(msg.chat_jid, commandResult.response);
+    }
+
+    // Reset session if requested
+    if (commandResult.shouldResetSession) {
+      delete sessions[group.folder];
+      saveJson(path.join(DATA_DIR, 'sessions.json'), sessions);
+    }
+
+    return;
+  }
 
   // Get all messages since last agent interaction so the session has full context
   const sinceTimestamp = lastAgentTimestamp[msg.chat_jid] || '';
@@ -157,18 +298,16 @@ async function processMessage(msg: NewMessage): Promise<void> {
 
   logger.info({ group: group.name, messageCount: missedMessages.length }, 'Processing message');
 
-  await setTyping(msg.chat_jid, true);
-  const response = await runAgent(group, prompt, msg.chat_jid);
-  await setTyping(msg.chat_jid, false);
+  const response = await runAgent(group, prompt, msg.chat_jid, msg.id);
 
   if (response) {
     lastAgentTimestamp[msg.chat_jid] = msg.timestamp;
-    await sendMessage(msg.chat_jid, `${ASSISTANT_NAME}: ${response}`);
+    await messenger.sendMessage(msg.chat_jid, `${ASSISTANT_NAME}: ${response}`);
   }
 }
 
-async function runAgent(group: RegisteredGroup, prompt: string, chatJid: string): Promise<string | null> {
-  const isMain = group.folder === MAIN_GROUP_FOLDER;
+async function runAgent(group: RegisteredGroup, prompt: string, chatJid: string, originalMessageId: string): Promise<string | null> {
+  const isMain = group.folder === MAIN_GROUP_FOLDER || group.isMainSession === true;
   const sessionId = sessions[group.folder];
 
   // Update tasks snapshot for container to read (filtered by group)
@@ -187,6 +326,10 @@ async function runAgent(group: RegisteredGroup, prompt: string, chatJid: string)
   const availableGroups = getAvailableGroups();
   writeGroupsSnapshot(group.folder, isMain, availableGroups, new Set(Object.keys(registeredGroups)));
 
+  const STATUS_DEBOUNCE_MS = 2000;
+  const lastStatusMessages: Record<string, { message: string; timestamp: number }> = {};
+  let statusMessageIdExists = false;
+
   try {
     const output = await runContainerAgent(group, {
       prompt,
@@ -194,6 +337,44 @@ async function runAgent(group: RegisteredGroup, prompt: string, chatJid: string)
       groupFolder: group.folder,
       chatJid,
       isMain
+    }, {
+      onStatusUpdate: async (message) => {
+        const now = Date.now();
+        const lastStatus = lastStatusMessages[originalMessageId];
+
+        // Send update if:
+        // 1. First status message for this message in this chat
+        // 2. Message content is significantly different (not just whitespace/punctuation)
+        // 3. Enough time has passed since last update
+        const shouldUpdate = !lastStatus ||
+          message !== lastStatus.message ||
+          (now - lastStatus.timestamp > STATUS_DEBOUNCE_MS);
+
+        if (shouldUpdate) {
+          const isNew = !statusMessageIdExists;
+          // Only pass replyToMessageId if it's a new message (for Telegram's reply support)
+          // // Feishu doesn't use replyToMessageId since WebSocket handles replies differently
+          if (isNew) {
+            await messenger.sendOrUpdateStatusMessage(
+              chatJid,
+              originalMessageId,
+              `⏳ ${message}`,
+              isNew,
+              // For Telegram, convert to number; Feishu ignores this parameter
+              parseInt(originalMessageId, 10) || undefined
+            );
+          } else {
+            await messenger.sendOrUpdateStatusMessage(
+              chatJid,
+              originalMessageId,
+              `⏳ ${message}`,
+              isNew
+            );
+          }
+          statusMessageIdExists = true;
+          lastStatusMessages[originalMessageId] = { message, timestamp: now };
+        }
+      }
     });
 
     if (output.newSessionId) {
@@ -203,22 +384,20 @@ async function runAgent(group: RegisteredGroup, prompt: string, chatJid: string)
 
     if (output.status === 'error') {
       logger.error({ group: group.name, error: output.error }, 'Container agent error');
+      // Update status message with error
+      await messenger.sendOrUpdateStatusMessage(chatJid, originalMessageId, `❌ Error: ${output.error || 'Unknown error'}`, false, undefined);
+      messenger.clearStatusMessage(chatJid, originalMessageId);
       return null;
     }
+
+    // Clear status message tracking before sending final result
+    messenger.clearStatusMessage(chatJid, originalMessageId);
 
     return output.result;
   } catch (err) {
     logger.error({ group: group.name, err }, 'Agent error');
+    messenger.clearStatusMessage(chatJid, originalMessageId);
     return null;
-  }
-}
-
-async function sendMessage(jid: string, text: string): Promise<void> {
-  try {
-    await sock.sendMessage(jid, { text });
-    logger.info({ jid, length: text.length }, 'Message sent');
-  } catch (err) {
-    logger.error({ jid, err }, 'Failed to send message');
   }
 }
 
@@ -253,12 +432,16 @@ function startIpcWatcher(): void {
             const filePath = path.join(messagesDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'message' && data.chatJid && data.text) {
+              if ((data.type === 'message' || data.type === 'status') && data.chatJid && data.text) {
                 // Authorization: verify this group can send to this chatJid
                 const targetGroup = registeredGroups[data.chatJid];
                 if (isMain || (targetGroup && targetGroup.folder === sourceGroup)) {
-                  await sendMessage(data.chatJid, `${ASSISTANT_NAME}: ${data.text}`);
-                  logger.info({ chatJid: data.chatJid, sourceGroup }, 'IPC message sent');
+                  // Status messages don't get the assistant name prefix (cleaner UI)
+                  const message = data.type === 'status'
+                    ? `⏳ ${data.text}`
+                    : `${ASSISTANT_NAME}: ${data.text}`;
+                  await messenger.sendMessage(data.chatJid, message);
+                  logger.info({ chatJid: data.chatJid, sourceGroup, type: data.type }, 'IPC message sent');
                 } else {
                   logger.warn({ chatJid: data.chatJid, sourceGroup }, 'Unauthorized IPC message attempt blocked');
                 }
@@ -324,8 +507,8 @@ async function processTaskIpc(
     trigger?: string;
     containerConfig?: RegisteredGroup['containerConfig'];
   },
-  sourceGroup: string,  // Verified identity from IPC directory
-  isMain: boolean       // Verified from directory path
+  sourceGroup: string,
+  isMain: boolean
 ): Promise<void> {
   // Import db functions dynamically to avoid circular deps
   const { createTask, updateTask, deleteTask, getTaskById: getTask } = await import('./db.js');
@@ -337,7 +520,7 @@ async function processTaskIpc(
         // Authorization: non-main groups can only schedule for themselves
         const targetGroup = data.groupFolder;
         if (!isMain && targetGroup !== sourceGroup) {
-          logger.warn({ sourceGroup, targetGroup }, 'Unauthorized schedule_task attempt blocked');
+          logger.warn({ sourceGroupGroup: targetGroup }, 'Unauthorized schedule_task attempt blocked');
           break;
         }
 
@@ -434,20 +617,6 @@ async function processTaskIpc(
       }
       break;
 
-    case 'refresh_groups':
-      // Only main group can request a refresh
-      if (isMain) {
-        logger.info({ sourceGroup }, 'Group metadata refresh requested via IPC');
-        await syncGroupMetadata(true);
-        // Write updated snapshot immediately
-        const availableGroups = getAvailableGroups();
-        const { writeGroupsSnapshot: writeGroups } = await import('./container-runner.js');
-        writeGroups(sourceGroup, true, availableGroups, new Set(Object.keys(registeredGroups)));
-      } else {
-        logger.warn({ sourceGroup }, 'Unauthorized refresh_groups attempt blocked');
-      }
-      break;
-
     case 'register_group':
       // Only main group can register new groups
       if (!isMain) {
@@ -470,80 +639,6 @@ async function processTaskIpc(
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }
-}
-
-async function connectWhatsApp(): Promise<void> {
-  const authDir = path.join(STORE_DIR, 'auth');
-  fs.mkdirSync(authDir, { recursive: true });
-
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-
-  sock = makeWASocket({
-    auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
-    printQRInTerminal: false,
-    logger,
-    browser: ['NanoClaw', 'Chrome', '1.0.0']
-  });
-
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      const msg = 'WhatsApp authentication required. Run /setup in Claude Code.';
-      logger.error(msg);
-      exec(`osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`);
-      setTimeout(() => process.exit(1), 1000);
-    }
-
-    if (connection === 'close') {
-      const reason = (lastDisconnect?.error as any)?.output?.statusCode;
-      const shouldReconnect = reason !== DisconnectReason.loggedOut;
-      logger.info({ reason, shouldReconnect }, 'Connection closed');
-
-      if (shouldReconnect) {
-        logger.info('Reconnecting...');
-        connectWhatsApp();
-      } else {
-        logger.info('Logged out. Run /setup to re-authenticate.');
-        process.exit(0);
-      }
-    } else if (connection === 'open') {
-      logger.info('Connected to WhatsApp');
-      // Sync group metadata on startup (respects 24h cache)
-      syncGroupMetadata().catch(err => logger.error({ err }, 'Initial group sync failed'));
-      // Set up daily sync timer
-      setInterval(() => {
-        syncGroupMetadata().catch(err => logger.error({ err }, 'Periodic group sync failed'));
-      }, GROUP_SYNC_INTERVAL_MS);
-      startSchedulerLoop({
-        sendMessage,
-        registeredGroups: () => registeredGroups,
-        getSessions: () => sessions
-      });
-      startIpcWatcher();
-      startMessageLoop();
-    }
-  });
-
-  sock.ev.on('creds.update', saveCreds);
-
-  sock.ev.on('messages.upsert', ({ messages }) => {
-    for (const msg of messages) {
-      if (!msg.message) continue;
-      const chatJid = msg.key.remoteJid;
-      if (!chatJid || chatJid === 'status@broadcast') continue;
-
-      const timestamp = new Date(Number(msg.messageTimestamp) * 1000).toISOString();
-
-      // Always store chat metadata for group discovery
-      storeChatMetadata(chatJid, timestamp);
-
-      // Only store full message content for registered groups
-      if (registeredGroups[chatJid]) {
-        storeMessage(msg, chatJid, msg.key.fromMe || false, msg.pushName || undefined);
-      }
-    }
-  });
 }
 
 async function startMessageLoop(): Promise<void> {
@@ -570,7 +665,7 @@ async function startMessageLoop(): Promise<void> {
     } catch (err) {
       logger.error({ err }, 'Error in message loop');
     }
-    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+    await new Promise(resolve => setTimeout(resolve, messenger.getPollInterval()));
   }
 }
 
@@ -598,12 +693,66 @@ function ensureContainerSystemRunning(): void {
   }
 }
 
+async function startMessenger(): Promise<void> {
+  // Initialize messenger based on environment variable
+  if (messengerType === 'feishu') {
+    messenger = new FeishuMessenger(
+      logger,
+      STORE_DIR,
+      registeredGroups,
+      POLL_INTERVAL
+    );
+    logger.info('Using Feishu messenger');
+  } else {
+    messenger = new TelegramMessenger(
+      logger,
+      STORE_DIR,
+      registeredGroups,
+      POLL_INTERVAL
+    );
+    logger.info('Using Telegram messenger');
+  }
+
+  await messenger.connect();
+
+  // Register commands (Telegram only)
+  if (messengerType === 'telegram') {
+    const botCommands = commands.map(cmd => ({
+      name: cmd.name,
+      description: cmd.description
+    }));
+    await messenger.registerCommands(botCommands);
+
+    // Verify commands are registered correctly
+    await (messenger as TelegramMessenger).verifyCommands(botCommands);
+  }
+
+  // Register message listener callback
+  messenger.startMessageListener(processMessage);
+
+  // Start message listener and other services
+  startSchedulerLoop({
+    sendMessage: (chatId: string, text: string) => messenger.sendMessage(chatId, text),
+    registeredGroups: () => registeredGroups,
+    getSessions: () => sessions
+  });
+  startIpcWatcher();
+
+  // Start message loop only if messenger needs polling
+  if (messenger.needsPolling()) {
+    startMessageLoop();
+  }
+
+  // Send startup greetings
+  await messenger.sendStartupGreetings(registeredGroups, MAIN_GROUP_FOLDER);
+}
+
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
   loadState();
-  await connectWhatsApp();
+  await startMessenger();
 }
 
 main().catch(err => {

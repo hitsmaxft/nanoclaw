@@ -20,7 +20,7 @@ export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '3000
 export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760', 10); // 10MB default
 export const IPC_POLL_INTERVAL = 1000;
 
-function escapeRegex(str: string): string {
+export function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 

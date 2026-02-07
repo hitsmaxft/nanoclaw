@@ -191,6 +191,52 @@ These are the creator's settings, stored here for reference:
 
 ---
 
+## Debugging Agent Issues
+
+When an agent isn't responding or behaving unexpectedly, you can check the Claude debug logs:
+
+### Find Debug Logs by SessionId
+
+Debug logs are stored at: `data/sessions/{groupFolder}/.claude/debug/{sessionId}.txt`
+
+**Steps to debug:**
+1. Find the running container: `container ls`
+2. Check container logs: `container logs {container-id}`
+3. Extract the sessionId from the log (e.g., "Session initialized: 58e6a95d-0a1c-4a60-bc49-2024f7249a8e")
+4. View debug logs: `tail -f data/sessions/main/.claude/debug/{sessionId}.txt`
+
+**Common issues:**
+- **429 errors**: API rate limiting - reduce concurrent requests or increase API quota
+- **Network errors**: Check internet connectivity and API endpoint availability
+- **Timeout**: Agent taking too long - may need to increase timeout in `registered_groups.json`
+
+### Example Debug Session
+
+```bash
+# 1. Find running containers
+container ls
+
+# 2. Check container logs
+container logs dde564a1-0013-4f8b-87c4-6f7919a7b7b9
+
+# 3. Extract sessionId from logs (e.g., 58e6a95d-0a1c-4a60-bc49-2024f7249a8e)
+
+# 4. View Claude debug logs
+tail -f data/sessions/main/.claude/debug/58e6a95d-0a1c-4a60-bc49-2024f7249a8e.txt
+```
+
+### Container Logs
+
+Container run logs are stored at: `groups/{groupFolder}/logs/container-{timestamp}.log`
+
+These logs show:
+- Input prompt and session ID
+- Container mounts and configuration
+- Stderr output (agent status messages)
+- Duration and exit code
+
+---
+
 ## Project Name
 
 **NanoClaw** - A reference to Clawdbot (now OpenClaw).

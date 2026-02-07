@@ -31,31 +31,68 @@ When you learn something important:
 - Add recurring context directly to this CLAUDE.md
 - Always index new memory files at the top of CLAUDE.md
 
-## Qwibit Ops Access
+### Temporary Notes
 
-You have access to Qwibit operations data at `/workspace/extra/qwibit-ops/` with these key areas:
+Use the `临时记录/` folder in the Obsidian vault (`/workspace/extra/notes/临时记录/`) for quick notes and drafts. When asked to record something temporarily or create a new note without specifying a location, default to this directory.
 
-- **sales/** - Pipeline, deals, playbooks, pitch materials (see `sales/CLAUDE.md`)
-- **clients/** - Active accounts, service delivery, client management (see `clients/CLAUDE.md`)
-- **company/** - Strategy, thesis, operational philosophy (see `company/CLAUDE.md`)
+**Note**: Do NOT automatically save news articles, news summaries, or similar time-sensitive content. These should only be saved if explicitly requested.
 
-Read the CLAUDE.md files in each folder for role-specific context and workflows.
+## Git Repositories
 
-**Key context:**
-- Qwibit is a B2B GEO (Generative Engine Optimization) agency
-- Pricing: $2,000-$4,000/month, month-to-month contracts
-- Team: Gavriel (founder, sales & client work), Lazer (founder, dealflow), Ali (PM)
-- Obsidian-based workflow with Kanban boards (PIPELINE.md, PORTFOLIO.md)
+When cloning git repositories, always clone them into the group's `repos/` directory:
 
-## WhatsApp Formatting
+```bash
+cd /workspace/group
+git clone <repo-url> repos/<repo-name>
+```
 
-Do NOT use markdown headings (##) in WhatsApp messages. Only use:
+This keeps repositories organized within each group's workspace and prevents conflicts between groups.
+
+## Notes Access
+
+You have full access to the user's notes repository at `/workspace/extra/notes/`.
+
+This is a git repository (`hitsmaxft/obnotes.git`) containing Obsidian notes and other documentation.
+
+### What You Can Do with Notes
+
+- **Read notes**: Search, browse, and analyze any markdown files in the repository
+- **Create notes**: Write new notes in the appropriate folders
+- **Update notes**: Edit existing notes, fix formatting, add content
+- **Organize notes**: Create folders, move files, maintain structure
+- **Search notes**: Use grep or find to locate specific information
+- **Git operations**: Commit, push, and pull changes to the notes repository
+
+### Common Note Tasks
+
+When the user asks to:
+- "Remember that..." → Create or update a note in `/workspace/extra/notes/`
+- "Find my notes about..." → Search `/workspace/extra/notes/` for relevant files
+- "Update the note about..." → Edit the specified file
+- "Create a note about..." → Write a new markdown file
+- "What do I have notes on?" → List or summarize the note structure
+- "Commit notes" → Git commit in `/workspace/extra/notes/`
+
+### Notes Best Practices
+
+- Use markdown formatting (headers, bullets, links, code blocks)
+- Create meaningful filenames
+- Organize with folders when content grows
+- Add tags for easy searching (#tag)
+- Link between notes using `[[Note Name]]` syntax (Obsidian format)
+- Commit changes with meaningful messages when requested
+
+## Telegram Formatting
+
+Telegram supports markdown, so you can use:
 - *Bold* (asterisks)
 - _Italic_ (underscores)
-- • Bullets (bullet points)
+- `Code` (backticks)
 - ```Code blocks``` (triple backticks)
+- **Headings** work in Telegram
+- • Bullets (bullet points)
 
-Keep messages clean and readable for WhatsApp.
+Keep messages clean and readable.
 
 ---
 
@@ -76,6 +113,8 @@ Key paths inside the container:
 - `/workspace/project/store/messages.db` - SQLite database
 - `/workspace/project/data/registered_groups.json` - Group config
 - `/workspace/project/groups/` - All group folders
+- `/workspace/group/` - Main group's workspace (use for repos/, etc.)
+- `/workspace/extra/notes/` - Notes git repository (hitsmaxft/obnotes.git)
 
 ---
 
@@ -150,12 +189,18 @@ Fields:
 3. Add the new group entry with `containerConfig` if needed
 4. Write the updated JSON back
 5. Create the group folder: `/workspace/project/groups/{folder-name}/`
-6. Optionally create an initial `CLAUDE.md` for the group
+6. Create subdirectories: `repos/` for git repositories
+7. Optionally create an initial `CLAUDE.md` for the group
 
 Example folder name conventions:
 - "Family Chat" → `family-chat`
 - "Work Team" → `work-team`
 - Use lowercase, hyphens instead of spaces
+
+After creating the group folder, initialize the repos directory:
+```bash
+mkdir -p /workspace/project/groups/{folder-name}/repos
+```
 
 #### Adding Additional Directories for a Group
 
@@ -208,3 +253,23 @@ When scheduling tasks for other groups, use the `target_group` parameter:
 - `schedule_task(prompt: "...", schedule_type: "cron", schedule_value: "0 9 * * 1", target_group: "family-chat")`
 
 The task will run in that group's context with access to their files and memory.
+
+## Working with Git
+
+### Best Practices
+
+1. **Clone locations**: Always clone repositories into the group's `repos/` directory
+   ```bash
+   cd /workspace/group
+   git clone https://github.com/user/repo.git repos/repo
+   ```
+
+2. **For other groups**: Use their specific repos directory
+   ```bash
+   cd /workspace/project/groups/{group-folder}/repos
+   git clone <repo-url>
+   ```
+
+3. **Keep repos organized**: Each group should have its own `repos/` directory to avoid conflicts
+
+4. **Persistent storage**: Repositories in `/workspace/group/` persist across sessions (mounted volume)

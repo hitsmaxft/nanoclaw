@@ -42,7 +42,8 @@ async function runTask(task: ScheduledTask, deps: SchedulerDependencies): Promis
   }
 
   // Update tasks snapshot for container to read (filtered by group)
-  const isMain = task.group_folder === MAIN_GROUP_FOLDER;
+  // Check both folder name and isMainSession flag
+  const isMain = task.group_folder === MAIN_GROUP_FOLDER || group.isMainSession === true;
   const tasks = getAllTasks();
   writeTasksSnapshot(task.group_folder, isMain, tasks.map(t => ({
     id: t.id,

@@ -233,6 +233,7 @@ async function main(): Promise<void> {
 
   try {
     log('Starting agent...');
+    log('STATUS: 🤖 Processing your request...');
 
     for await (const message of query({
       prompt,
@@ -261,12 +262,40 @@ async function main(): Promise<void> {
         log(`Session initialized: ${newSessionId}`);
       }
 
+      // Detect tool calls in assistant messages
+      if (message.type === 'assistant') {
+        const assistantMsg = message as any;
+        const content = assistantMsg.message?.content;
+
+        if (content && Array.isArray(content)) {
+          const toolUses = content.filter((block: any) => block.type === 'tool_use');
+
+          if (toolUses.length > 0) {
+            // Show tools being used (combined message if multiple)
+            if (toolUses.length === 1) {
+              const friendlyName = toolUses[0].name
+                .replace(/^mcp__nanoclaw__/, '')
+                .replace(/_/g, ' ');
+              log(`STATUS: ${friendlyName.charAt(0).toUpperCase() + friendlyName.slice(1)}...`);
+            } else {
+              // Multiple tools - show count and names
+              const names = toolUses.map((t: any) => t.name
+                .replace(/^mcp__nanoclaw__/, '')
+                .replace(/_/g, ' ')
+              );
+              log(`STATUS: Using ${toolUses.length} tools: ${names.join(', ')}...`);
+            }
+          }
+        }
+      }
+
       if ('result' in message && message.result) {
         result = message.result as string;
       }
     }
 
     log('Agent completed successfully');
+    log('STATUS: ✅ Completed');
     writeOutput({
       status: 'success',
       result,
