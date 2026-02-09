@@ -1,14 +1,14 @@
 # NanoClaw Requirements
 
-Original requirements and design decisions from the project creator.
+Original requirements and design decisions from project creator.
 
 ---
 
 ## Why This Exists
 
-This is a lightweight, secure alternative to OpenClaw (formerly ClawBot). That project became a monstrosity - 4-5 different processes running different gateways, endless configuration files, endless integrations. It's a security nightmare where agents don't run in isolated processes; there's all kinds of leaky workarounds trying to prevent them from accessing parts of the system they shouldn't. It's impossible for anyone to realistically understand the whole codebase. When you run it you're kind of just yoloing it.
+This is a lightweight, secure alternative to OpenClaw (formerly ClawBot). That project became a monstrosity - 4-5 different processes running different gateways, endless configuration files, endless integrations. It's a security nightmare where agents don't run in aisolated processes; there's all kinds of leaky workarounds trying to prevent them from accessing parts of the system they shouldn't. It's impossible for anyone to realistically understand the whole codebase. When you run it you're kind of just yoloing it.
 
-NanoClaw gives you the core functionality without that mess.
+NanoClaw gives you → core functionality without that mess.
 
 ---
 
@@ -24,21 +24,21 @@ Instead of application-level permission systems trying to prevent agents from ac
 
 ### Built for One User
 
-This isn't a framework or a platform. It's working software for my specific needs. I use WhatsApp and Email, so it supports WhatsApp and Email. I don't use Telegram, so it doesn't support Telegram. I add the integrations I actually want, not every possible integration.
+This isn't a framework or a platform. It's working software for my specific needs. I use WhatsApp and Email, so it supports WhatsApp and Email. I don't use Telegram, so it doesn't support Telegram. I add integrations I actually want, not every possible integration.
 
 ### Customization = Code Changes
 
-No configuration sprawl. If you want different behavior, modify the code. The codebase is small enough that this is safe and practical. Very minimal things like the trigger word are in config. Everything else - just change the code to do what you want.
+No configuration sprawl. If you want different behavior, modify the code. The codebase is small enough that this is safe and practical. Very minimal things like the trigger word are in config. Everything else - just change code to do what you want.
 
 ### AI-Native Development
 
-I don't need an installation wizard - Claude Code guides the setup. I don't need a monitoring dashboard - I ask Claude Code what's happening. I don't need elaborate logging UIs - I ask Claude to read the logs. I don't need debugging tools - I describe the problem and Claude fixes it.
+I don't need an installation wizard - Claude Code guides → setup. I don't need a monitoring dashboard - I ask Claude Code what's happening. I don't need elaborate logging UIs - I ask Claude to read → logs. I don't need debugging tools - I describe → problem and Claude fixes it.
 
 The codebase assumes you have an AI collaborator. It doesn't need to be excessively self-documenting or self-debugging because Claude is always there.
 
 ### Skills Over Features
 
-When people contribute, they shouldn't add "Telegram support alongside WhatsApp." They should contribute a skill like `/add-telegram` that transforms the codebase. Users fork the repo, run skills to customize, and end up with clean code that does exactly what they need - not a bloated system trying to support everyone's use case simultaneously.
+When people contribute, they shouldn't add "Telegram support alongside WhatsApp." They should contribute a skill like `/add-telegram` that transforms the codebase. Users fork → repo, run skills to customize, and end up with clean code that does exactly what they need - not a bloated system trying to support everyone's use case simultaneously.
 
 ---
 
@@ -60,7 +60,7 @@ The project currently uses Apple Container (macOS-only). We need:
 - This unlocks Linux support and broader deployment options
 
 ### Platform Support
-- `/setup-linux` - Make the full setup work on Linux (depends on Docker conversion)
+- `/setup-linux` - Make full setup work on Linux (depends on Docker conversion)
 - `/setup-windows` - Windows support via WSL2 + Docker
 
 ---
@@ -115,20 +115,20 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 - Tasks run as full agents in the context of the group that created them
 - Tasks have access to all tools including Bash (safe in container)
 - Tasks can optionally send messages to their group via `send_message` tool, or complete silently
-- Task runs are logged to the database with duration and result
+- Task runs are logged to → database with duration and result
 - Schedule types: cron expressions, intervals (ms), or one-time (ISO timestamp)
 - From main: can schedule tasks for any group, view/manage all tasks
 - From other groups: can only manage that group's tasks
 
 ### Group Management
-- New groups are added explicitly via the main channel
+- New groups are added explicitly via main channel
 - Groups are registered by editing `data/registered_groups.json`
 - Each group gets a dedicated folder under `groups/`
 - Groups can have additional directories mounted via `containerConfig`
 
 ### Main Channel Privileges
-- Main channel is the admin/control group (typically self-chat)
-- Can write to global memory (`groups/CLAUDE.md`)
+- Main channel is to admin/control group (typically self-chat)
+- Can write to → global memory (`groups/CLAUDE.md`)
 - Can schedule tasks for any group
 - Can view and manage tasks from all groups
 - Can configure additional directory mounts for any group
@@ -155,7 +155,7 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 - Standard Claude Agent SDK capabilities
 
 ### Browser Automation
-- agent-browser CLI with Chromium in container
+- agent-browser CLI with Chromium in the container
 - Snapshot-based interaction with element references (@e1, @e2, etc.)
 - Screenshots, PDFs, video recording
 - Authentication state persistence
@@ -167,7 +167,7 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 ### Philosophy
 - Minimal configuration files
 - Setup and customization done via Claude Code
-- Users clone the repo and run Claude Code to configure
+- Users clone → repo and run Claude Code to configure
 - Each user gets a custom setup matching their exact needs
 
 ### Skills
@@ -188,6 +188,52 @@ These are the creator's settings, stored here for reference:
 - **Response prefix**: `Andy:`
 - **Persona**: Default Claude (no custom personality)
 - **Main channel**: Self-chat (messaging yourself in WhatsApp)
+
+---
+
+## Debugging Agent Issues
+
+When an agent isn't responding or behaving unexpectedly, you can check → Claude debug logs:
+
+### Find Debug Logs by SessionId
+
+Debug logs are stored at: `data/sessions/{groupFolder}/.claude/debug/{sessionId}.txt`
+
+**Steps to debug:**
+1. Find running container: `container ls`
+2. Check container logs: `container logs {container-id}`
+3. Extract sessionId from → log (e.g., "Session initialized: 58e6a95d-0a1c-4a60-bc49-2024f7249a8e")
+4. View debug logs: `tail -f data/sessions/main/.claude/debug/{sessionId}.txt`
+
+**Common issues:**
+- **429 errors**: API rate limiting - reduce concurrent requests or increase API quota
+- **Network errors**: Check internet connectivity and API endpoint availability
+- **Timeout**: Agent taking too long - may need to increase timeout in `registered_groups.json`
+
+### Example Debug Session
+
+```bash
+# 1. Find running containers
+container ls
+
+# 2. Check container logs
+container logs dde564a1-0013-4f8b-87c4-6f7919a7b7b9
+
+# 3. Extract sessionId from → logs (e.g., 58e6a95d-0a1c-4a60-bc49-2024f7249a8e)
+
+# 4. View Claude debug logs
+tail -f data/sessions/main/.claude/debug/58e6a95d-0a1c-4a60-bc49-2024f7249a8e.txt
+```
+
+### Container Logs
+
+Container run logs are stored at: `groups/{groupFolder}/logs/container-{timestamp}.log`
+
+These logs show:
+- Input prompt and session ID
+- Container mounts and configuration
+- Stderr output (agent status messages)
+- Duration and exit code
 
 ---
 

@@ -266,6 +266,7 @@ async function main(): Promise<void> {
 
   try {
     log('Starting agent...');
+    log('STATUS: 🤖 Processing your request...');
 
     for await (const message of query({
       prompt,
@@ -296,23 +297,70 @@ async function main(): Promise<void> {
         }
       }
     })) {
-      if (message.type === 'system' && message.subtype === 'init') {
-        newSessionId = message.session_id;
+      const msgAny = message as any;
+      if (msgAny.type === 'system' && msgAny.subtype === 'init') {
+        newSessionId = msgAny.session_id;
         log(`Session initialized: ${newSessionId}`);
       }
 
-      if (message.type === 'result') {
-        if (message.subtype === 'success' && message.structured_output) {
-          result = message.structured_output as AgentResponse;
+      // Detect tool calls in assistant messages
+      if (msgAny.type === 'assistant') {
+        const content = msgAny.message?.content;
+
+        if (content && Array.isArray(content)) {
+          const toolUses = content.filter((block: any) => block.type === 'tool_use');
+
+          if (toolUses.length > 0) {
+            // Show tools being used (combined message if multiple)
+            if (toolUses.length === 1) {
+              const friendlyName = toolUses[0].name
+                .replace(/^mcp__nanoclaw__/, '')
+                .replace(/_/g, ' ');
+              log(`STATUS: ${friendlyName.charAt(0).toUpperCase() + friendlyName.slice(1)}...`);
+            } else {
+              // Multiple tools - show count and names
+              const names = toolUses.map((t: any) => t.name
+                .replace(/^mcp__nanoclaw__/, '')
+                .replace(/_/g, ' ')
+              );
+              log(`STATUS: Using ${toolUses.length} tools: ${names.join(', ')}...`);
+            }
+          }
+        }
+      }
+
+      if (msgAny.type === 'result') {
+        if (msgAny.subtype === 'success' && msgAny.structured_output) {
+          result = msgAny.structured_output as AgentResponse;
           if (result.outputType === 'message' && !result.userMessage) {
             log('Warning: outputType is "message" but userMessage is missing, treating as "log"');
             result = { outputType: 'log', internalLog: result.internalLog };
           }
           log(`Agent result: outputType=${result.outputType}${result.internalLog ? `, log=${result.internalLog}` : ''}`);
-        } else if (message.subtype === 'success' || message.subtype === 'error_max_structured_output_retries') {
+        } else if (msgAny.subtype === 'success' || msgAny.subtype === 'error_max_structured_output_retries') {
           // Structured output missing or agent couldn't produce valid structured output — fall back to text
-          log(`Structured output unavailable (subtype=${message.subtype}), falling back to text`);
-          const textResult = 'result' in message ? (message as { result?: string }).result : null;
+          log(`Structured output unavailable (subtype=${msgAny.subtype}), falling back to text`);
+
+          // Try to extract text result from message.result (older SDK) or message.content (newer SDK)
+          let textResult: string | null = null;
+
+          if (msgAny.result && typeof msgAny.result === 'string') {
+            textResult = msgAny.result;
+          } else if (msgAny.message?.content) {
+            // Extract text from content blocks
+            const content = msgAny.message.content;
+            if (typeof content === 'string') {
+              textResult = content;
+            } else if (Array.isArray(content)) {
+              {
+                const textBlocks = content
+                  .filter((c: { type?: string }) => c.type === 'text')
+                  .map((c: { text: string }) => c.text);
+                textResult = textBlocks.join('');
+              }
+            }
+          }
+
           if (textResult) {
             result = { outputType: 'message', userMessage: textResult };
           }
@@ -321,6 +369,7 @@ async function main(): Promise<void> {
     }
 
     log('Agent completed successfully');
+    log('STATUS: ✅ Completed');
     writeOutput({
       status: 'success',
       result: result ?? { outputType: 'log' },
@@ -329,7 +378,24 @@ async function main(): Promise<void> {
 
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
+    const errorStack = err instanceof Error ? err.stack : undefined;
     log(`Agent error: ${errorMessage}`);
+    if (errorStack) {
+      log(`Error stack: ${errorStack}`);
+    }
+
+    // If we already captured a result before the error, return success with that result
+    // This handles cases where claude-code exits with non-zero but still produced output
+    if (result) {
+      log(`Using captured result despite error (result type: ${result.outputType})`);
+      writeOutput({
+        status: 'success',
+        result,
+        newSessionId
+      });
+      process.exit(0);
+    }
+
     writeOutput({
       status: 'error',
       result: null,

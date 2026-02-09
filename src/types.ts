@@ -39,6 +39,8 @@ export interface RegisteredGroup {
   added_at: string;
   containerConfig?: ContainerConfig;
   requiresTrigger?: boolean; // Default: true for groups, false for solo chats
+  allowedUsers?: string[]; // For private chats: restrict to specific sender IDs
+  isMainSession?: boolean; // True if this is the main session (first p2p chat registered)
 }
 
 export interface NewMessage {
@@ -48,6 +50,7 @@ export interface NewMessage {
   sender_name: string;
   content: string;
   timestamp: string;
+  chat_type?: 'private' | 'group'; // Private chat vs group chat
 }
 
 export interface ScheduledTask {
@@ -72,4 +75,63 @@ export interface TaskRunLog {
   status: 'success' | 'error';
   result: string | null;
   error: string | null;
+}
+
+/**
+ * Messenger Interface - abstraction for different messaging platforms
+ * Allows NanoClaw to work with Telegram, WhatsApp, Slack, etc.
+ */
+export interface Messenger {
+  /**
+   * Initialize messenger and connect to service
+   */
+  connect(): Promise<void>;
+
+  /**
+   * Register slash commands for discoverability
+   */
+  registerCommands(commands: Array<{ name: string; description: string }>): Promise<void>;
+
+  /**
+   * Send a text message to a chat
+   */
+  sendMessage(chatId: string, text: string): Promise<void>;
+
+  /**
+   * Send or update a status message with edit support
+   */
+  sendOrUpdateStatusMessage(chatId: string, sessionId: string, text: string, isNew: boolean, replyToMessageId?: string | number | undefined): Promise<void>;
+
+  /**
+   * Clear status message tracking for a chat or session
+   */
+  clearStatusMessage(chatId: string, sessionId?: string): void;
+
+  /**
+   * Start listening for incoming messages
+   * @param onMessage Callback for handling new messages
+   */
+  startMessageListener(onMessage: (msg: NewMessage) => Promise<void>): void;
+
+  /**
+   * Get polling interval for checking new messages from database
+   */
+  getPollInterval(): number;
+
+  /**
+   * Whether this messenger requires database polling for messages
+   * Returns false for WebSocket-based messengers (Feishu)
+   * Returns true for polling-based messengers (Telegram)
+   */
+  needsPolling(): boolean;
+
+  /**
+   * Start messenger service
+   */
+  start(): Promise<void>;
+
+  /**
+   * Send startup greetings to registered groups
+   */
+  sendStartupGreetings(registeredGroups: Record<string, RegisteredGroup>, mainGroupFolder: string): Promise<void>;
 }

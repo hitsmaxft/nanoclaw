@@ -1,8 +1,8 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
-
-import { proto } from '@whiskeysockets/baileys';
+import readline from 'readline';
+import TelegramBot from 'node-telegram-bot-api';
 
 import { DATA_DIR, STORE_DIR } from './config.js';
 import { NewMessage, RegisteredGroup, ScheduledTask, TaskRunLog } from './types.js';
@@ -179,6 +179,14 @@ export function getAllChats(): ChatInfo[] {
 }
 
 /**
+ * Get specific chat information.
+ */
+export function getChat(chatJid: string): ChatInfo | null {
+  const row = db.prepare(`SELECT jid, name, last_message_time FROM chats WHERE jid = ?`).get(chatJid) as { jid: string; name: string; last_message_time: string } | undefined;
+  return row ? { jid: row.jid, name: row.name, last_message_time: row.last_message_time } : null;
+}
+
+/**
  * Get timestamp of last group metadata sync.
  */
 export function getLastGroupSync(): string | null {
@@ -202,13 +210,50 @@ export function setLastGroupSync(): void {
 /**
  * Store a message with full content.
  * Only call this for registered groups where message history is needed.
+ * Generic version that works with any messenger platform.
  */
-export function storeMessage(
-  msg: proto.IWebMessageInfo,
-  chatJid: string,
-  isFromMe: boolean,
-  pushName?: string,
-): void {
+export interface StoredMessage {
+  id: string;
+  chat_jid: string;
+  sender: string;
+  sender_name: string;
+  content: string;
+  timestamp: string;
+  is_from_me: boolean;
+}
+
+export function storeMessage(msg: StoredMessage, chatJid: string, isFromMe: boolean): void {
+  db.prepare(`INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(msg.id, chatJid, msg.sender, msg.sender_name, msg.content, msg.timestamp, isFromMe ? 1 : 0);
+}
+
+/**
+ * Telegram-specific message storage function (for backward compatibility)
+ */
+export function storeTelegramMessage(msg: TelegramBot.Message, chatJid: string, isFromMe: boolean): void {
+  if (!msg.from) return;
+
+  const content = msg.text || '';
+  const timestamp = new Date(msg.date * 1000).toISOString();
+  const sender = msg.from.id.toString();
+  const senderName = `${msg.from.first_name || ''} ${msg.from.last_name || ''}`.trim() || msg.from.username || sender;
+  const msgId = msg.message_id.toString();
+
+  storeMessage({
+    id: msgId,
+    chat_jid: chatJid,
+    sender,
+    sender_name: senderName,
+    content,
+    timestamp,
+    is_from_me: isFromMe,
+  }, chatJid, isFromMe);
+}
+
+/**
+ * WhatsApp-specific message storage function (for backward compatibility)
+ */
+export function storeWhatsAppMessage(msg: any, chatJid: string, isFromMe: boolean, pushName?: string): void {
   if (!msg.key) return;
 
   const content =
@@ -223,17 +268,15 @@ export function storeMessage(
   const senderName = pushName || sender.split('@')[0];
   const msgId = msg.key.id || '';
 
-  db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    msgId,
-    chatJid,
+  storeMessage({
+    id: msgId,
+    chat_jid: chatJid,
     sender,
-    senderName,
+    sender_name: senderName,
     content,
     timestamp,
-    isFromMe ? 1 : 0,
-  );
+    is_from_me: isFromMe,
+  }, chatJid, isFromMe);
 }
 
 export function getNewMessages(
@@ -587,3 +630,263 @@ function migrateJsonState(): void {
     }
   }
 }
+
+// ==================== Feishu Message Types ====================
+
+/**
+ * Feishu message types supported by bot
+ */
+export type FeishuMessageType =
+  | 'text'
+  | 'post'
+  | 'image'
+  | 'file'
+  | 'audio'
+  | 'video'
+  | 'sticker'
+  | 'system'
+  | 'share_chat'
+  | 'share_user'
+  | string;
+
+/**
+ * Feishu message sender information
+ */
+export interface FeishuSender {
+  sender_id: {
+    open_id?: string;
+    user_id?: string;
+    union_id?: string;
+  };
+  sender_type?: 'user' | 'app' | string;
+  tenant_key?: string;
+}
+
+/**
+ * Feishu mention in message
+ */
+export interface FeishuMention {
+  key: string;
+  id: {
+    open_id?: string;
+    user_id?: string;
+    union_id?: string;
+  };
+  name: string;
+  tenant_key?: string;
+}
+
+/**
+ * Feishu message structure (subset used for storage)
+ */
+export interface FeishuMessage {
+  message_id: string;
+  root_id?: string;
+  parent_id?: string;
+  chat_id: string;
+  chat_type: 'p2p' | 'group';
+  message_type: FeishuMessageType;
+  content: string;
+  create_time?: string;  // Milliseconds timestamp as string
+  update_time?: string;
+  deleted?: boolean;
+  mentions?: FeishuMention[];
+  upper_message_id?: string;
+}
+
+/**
+ * Parse Feishu message content based on message type
+ * Extracts text representation for database storage
+ */
+function parseFeishuContent(message: FeishuMessage): { text: string; mediaInfo?: string } {
+  const { content, message_type } = message;
+
+  try {
+    const parsed = JSON.parse(content);
+
+    switch (message_type) {
+      case 'text':
+        return { text: parsed.text || '' };
+
+      case 'post': {
+        // Rich text post message
+        const title = parsed.zh_cn?.title || parsed.en_us?.title || parsed.title || '';
+        const contentBlocks = parsed.zh_cn?.content || parsed.en_us?.content || parsed.content || [];
+        let text = title ? `${title}\n\n` : '';
+
+        for (const paragraph of contentBlocks) {
+          if (Array.isArray(paragraph)) {
+            for (const element of paragraph) {
+              switch (element.tag) {
+                case 'text':
+                  text += element.text || '';
+                  break;
+                case 'a':
+                  text += element.text || element.href || '';
+                  break;
+                case 'at':
+                  text += `@${element.user_name || element.user_id || 'user'}`;
+                  break;
+                case 'img':
+                  text += '<media:image>';
+                  break;
+                case 'media':
+                  text += `<media:${element.file_name || 'file'}>`;
+                  break;
+                case 'emotion':
+                  text += `[${element.emoji_type || 'emoji'}]`;
+                  break;
+              }
+            }
+            text += '\n';
+          }
+        }
+        return { text: text.trim() || '[Rich Text Message]' };
+      }
+
+      case 'image':
+        return {
+          text: '<media:image>',
+          mediaInfo: `image_key:${parsed.image_key}`
+        };
+
+      case 'file':
+        return {
+          text: '<media:document>',
+          mediaInfo: `file_key:${parsed.file_key}|name:${parsed.file_name || 'unknown'}`
+        };
+
+      case 'audio':
+        return {
+          text: '<media:audio>',
+          mediaInfo: `file_key:${parsed.file_key}|duration:${parsed.duration || 0}`
+        };
+
+      case 'video':
+        return {
+          text: '<media:video>',
+          mediaInfo: `file_key:${parsed.file_key}|image_key:${parsed.image_key || ''}`
+        };
+
+      case 'sticker':
+        return {
+          text: '<media:sticker>',
+          mediaInfo: `file_key:${parsed.file_key}`
+        };
+
+      case 'media':
+        return {
+          text: '<media:file>',
+          mediaInfo: `file_key:${parsed.file_key}|name:${parsed.file_name || 'unknown'}`
+        };
+
+      case 'share_chat':
+        return {
+          text: '<share:chat>',
+          mediaInfo: `chat_id:${parsed.share_chat_id}`
+        };
+
+      case 'share_user':
+        return {
+          text: '<share:user>',
+          mediaInfo: `user_id:${parsed.share_user_id}`
+        };
+
+      case 'system':
+        return { text: `[System: ${parsed.type || 'event'}]` };
+
+      case 'location':
+        return {
+          text: '<location>',
+          mediaInfo: `name:${parsed.name || ''}|address:${parsed.address || ''}`
+        };
+
+      default:
+        return { text: `[${message_type}]` };
+    }
+  } catch {
+    // If parsing fails, return raw content
+    return { text: content };
+  }
+}
+
+/**
+ * Extract sender name from Feishu sender info
+ * Falls back to open_id if name lookup failed
+ */
+function extractFeishuSenderName(sender: FeishuSender, fallbackName?: string): string {
+  if (fallbackName && fallbackName !== sender.sender_id.open_id) {
+    return fallbackName;
+  }
+  // Return most specific ID we have
+  return sender.sender_id.user_id ||
+         sender.sender_id.union_id ||
+ sender.sender_id.open_id ||
+         'Unknown';
+}
+
+/**
+ * Store a Feishu message to the database
+ * Handles all Feishu message types (text, post, image, file, audio, video, sticker, etc.)
+ *
+ * @param message The Feishu message object
+ * @param sender The Feishu sender info
+ * @param chatJid The chat JID (same as message.chat_id)
+ * @param isFromMe Whether is message is from bot itself
+ * @param resolvedName Optional resolved display name for sender
+ */
+export function storeFeishuMessage(
+  message: FeishuMessage,
+  sender: FeishuSender,
+  chatJid: string,
+  isFromMe: boolean,
+  resolvedName?: string
+): void {
+  // Parse content based on message type
+  const { text, mediaInfo } = parseFeishuContent(message);
+
+  // Build full content with media info
+  const fullContent = mediaInfo ? `${text} [${mediaInfo}]` : text;
+
+  // Parse timestamp (Feishu uses milliseconds)
+  const timestamp = message.create_time
+    ? new Date(parseInt(message.create_time, 10)).toISOString()
+    : new Date().toISOString();
+
+  // Extract sender ID (prefer user_id, fallback to open_id)
+  const senderId = sender.sender_id.user_id ||
+                   sender.sender_id.union_id ||
+                   sender.sender_id.open_id ||
+                   'unknown';
+
+  // Extract sender name
+  const senderName = extractFeishuSenderName(sender, resolvedName);
+
+  // Store message
+  storeMessage({
+    id: message.message_id,
+    chat_jid: chatJid,
+    sender: senderId,
+    sender_name: senderName,
+    content: fullContent,
+    timestamp,
+    is_from_me: isFromMe,
+  }, chatJid, isFromMe);
+}
+
+/**
+ * Feishu-specific message storage with full context
+ * Use this when you have a complete Feishu message event
+ */
+export function storeFeishuMessageEvent(
+  event: {
+    message: FeishuMessage;
+    sender: FeishuSender;
+  },
+  chatJid: string,
+  isFromMe: boolean,
+  resolvedName?: string
+): void {
+  storeFeishuMessage(event.message, event.sender, chatJid, isFromMe, resolvedName);
+}
+
