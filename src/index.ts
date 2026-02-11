@@ -7,6 +7,7 @@ import { CronExpressionParser } from 'cron-parser';
 import {
   ASSISTANT_NAME,
   DATA_DIR,
+  escapeRegex,
   IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
@@ -343,8 +344,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
+    // Build trigger pattern from group's trigger string
+    const triggerPattern = group.trigger
+      ? new RegExp(`^${escapeRegex(group.trigger)}\\b`, 'i')
+      : TRIGGER_PATTERN;
     const hasTrigger = missedMessages.some((m) =>
-      TRIGGER_PATTERN.test(m.content.trim()),
+      triggerPattern.test(m.content.trim()),
     );
     if (!hasTrigger) return true;
   }
